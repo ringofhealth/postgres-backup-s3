@@ -1,46 +1,77 @@
-name: build and push images
+name: test, build, and publish images
 
 on:
+  pull_request:
   push:
-    branches: ['master']
+    branches: [master]
+    tags: ['v*']
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
-  build-and-push-image:
+  lint:
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        include:
-          - { postgres: 12, alpine: '3.12' }
-          - { postgres: 13, alpine: '3.14' }
-          - { postgres: 14, alpine: '3.16' }
-          - { postgres: 15, alpine: '3.17' }
-          - { postgres: 16, alpine: '3.19' }
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v2
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install --yes shellcheck
+      - name: Lint scripts
+        run: make lint
+      - name: Run unit tests
+        run: make test
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+  integration:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['16', '17', '18']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Encrypted backup and restore round trip
+        env:
+          POSTGRES_VERSION: ${{ matrix.postgres }}
+        run: make integration
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
+  publish:
+    if: github.event_name == 'push'
+    needs: integration
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['16', '17', '18']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Log in to DockerHub
-        uses: docker/login-action@v1
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v2
+      - name: Build and publish PostgreSQL ${{ matrix.postgres }} client image
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ github.repository }}:${{ matrix.postgres }}
+          platforms: linux/amd64,linux/arm64
           build-args: |
-            ALPINE_VERSION=${{ matrix.alpine }}
-          platforms: |
-            linux/amd64
-            linux/arm64
+            POSTGRES_VERSION=${{ matrix.postgres }}
+          tags: |
+            ${{ github.repository }}:${{ matrix.postgres }}
+            ghcr.io/${{ github.repository }}:${{ matrix.postgres }}
+          cache-from: type=gha,scope=postgres-${{ matrix.postgres }}
+          cache-to: type=gha,mode=max,scope=postgres-${{ matrix.postgres }}
