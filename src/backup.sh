@@ -33,9 +33,9 @@ passphrase_file="${run_dir}/passphrase"
 archive_suffix="dump"
 if encryption_enabled; then archive_suffix="dump.gpg"; fi
 
-object_key="${S3_PREFIX}/${BACKUP_NAME}_${timestamp}.${archive_suffix}"
+object_key="$(prefixed_key "${BACKUP_NAME}_${timestamp}.${archive_suffix}")"
 manifest_key="${object_key}.manifest.json"
-temporary_key="${S3_PREFIX}/.incomplete/${BACKUP_NAME}_${timestamp}_${run_id}.${archive_suffix}"
+temporary_key="$(prefixed_key ".incomplete/${BACKUP_NAME}_${timestamp}_${run_id}.${archive_suffix}")"
 temporary_uploaded="no"
 published="no"
 
@@ -126,7 +126,7 @@ temporary_uploaded="yes"
 [[ "$bytes" =~ ^[0-9]+$ ]] || die "local byte count calculation failed"
 (( bytes > 0 )) || die "pg_dump produced an empty archive"
 
-temporary_head="$(aws_command s3api head-object --bucket "$S3_BUCKET" --key "$temporary_key" --output json)"
+temporary_head="$(head_object_with_retry "$temporary_key")"
 temporary_bytes="$(jq -r '.ContentLength' <<< "$temporary_head")"
 [[ "$temporary_bytes" == "$bytes" ]] || die "temporary upload size mismatch expected=${bytes} actual=${temporary_bytes}"
 

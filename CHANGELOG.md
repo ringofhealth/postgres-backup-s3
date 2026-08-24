@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add an exact-base-image pgBackRest target with full, differential,
+  incremental, WAL/PITR, repository verification, and guarded restore modes.
+- Keep scheduler controls outside pgBackRest's reserved environment namespace.
+- Add first-class amd64/arm64 build verification for the physical sidecar.
+
 ## 2.0.0
 
 - Add manifest-last, temporary-key publication.

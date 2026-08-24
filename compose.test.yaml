@@ -67,3 +67,6 @@ services:
         condition: service_healthy
       minio:
         condition: service_started
+    volumes:
+      - ${TEST_DATA_ROOT:?integration script sets TEST_DATA_ROOT}/work:/work
+      - ${TEST_DATA_ROOT:?integration script sets TEST_DATA_ROOT}/state:/state

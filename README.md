@@ -1,9 +1,10 @@
 # postgres-backup-s3
 
-A small, generic sidecar for encrypted PostgreSQL logical backups to Amazon S3
-and compatible object stores. It publishes a backup only after the dump,
-upload, size check, and configured integrity check succeed. Restore is
-verification-only by default.
+A small, generic PostgreSQL backup sidecar for Amazon S3 and compatible object
+stores. Its default image publishes encrypted, manifest-backed logical dumps.
+The same repository also provides an opt-in `pgbackrest` image target for
+physical full/differential/incremental backups, continuous WAL archiving, and
+point-in-time recovery.
 
 The images contain matching PostgreSQL 16, 17, or 18 client tools and are
 published for `linux/amd64` and `linux/arm64`.
@@ -38,9 +39,9 @@ treat the manifest—not an arbitrary `.dump` object—as the publication marker
 - Passwords, S3 keys, and the encryption passphrase support Docker/Kubernetes
   `_FILE` secrets.
 
-This is a portable logical-backup layer. It is not continuous archiving or
-point-in-time recovery. Use WAL-G, pgBackRest, or a managed PostgreSQL service
-when your recovery-point objective requires WAL/PITR.
+The default published PostgreSQL-version tags remain the portable logical
+backup layer. Physical/WAL mode is a separate image target because it must be
+built from the exact PostgreSQL/extension image used by the database.
 
 ## Quick start
 
@@ -104,6 +105,68 @@ local file.
 `BACKUP_MODE=staged` writes and validates a local custom archive before upload.
 Use it when local disk is plentiful or when debugging. `KEEP_LOCAL_BACKUP=yes`
 keeps the successful run directory; it is intentionally off by default.
+
+## Physical backups and WAL with pgBackRest
+
+Build the physical target from the exact image running PostgreSQL. That image
+must already contain pgBackRest; TimescaleDB's HA image does:
+
+```sh
+docker build \
+  --target pgbackrest \
+  --build-arg PGBACKREST_BASE_IMAGE=timescale/timescaledb-ha:pg18.4-ts2.28.3 \
+  --tag postgres-backup-s3:pgbackrest-pg18 .
+```
+
+The database and sidecar share PostgreSQL's Unix socket and pgBackRest spool.
+The sidecar mounts `PGDATA` read-only. PostgreSQL's own `archive_command` uses
+the same repository configuration and must include the explicit empty config
+file so an image-specific default path cannot change behavior:
+
+```text
+archive_mode=on
+archive_command=pgbackrest --config=/dev/null --stanza=app archive-push %p
+```
+
+Use pgBackRest's native `PGBACKREST_*` variables only for pgBackRest options.
+Scheduler controls intentionally use a different namespace:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BACKUP_FULL_SCHEDULE` | `17 3 * * 0` | Weekly full backup. |
+| `BACKUP_DIFF_SCHEDULE` | `17 3 * * 1-6` | Daily differential backup. |
+| `BACKUP_INCR_SCHEDULE` | `47 0,6,12,18 * * *` | Six-hour incremental backup. |
+| `BACKUP_CHECK_SCHEDULE` | `37 2 * * *` | Daily repository/archive check. |
+| `INIT_ON_STARTUP` | `yes` | Idempotently create and check the stanza before scheduling. |
+| `RUN_ON_STARTUP` | `no` | Run an incremental backup when the daemon starts. |
+| `STATE_DIR` | `/state` | Lock, schedule, and last-success state. |
+
+Common commands are exposed through the same sidecar entrypoint:
+
+```sh
+docker run --rm postgres-backup-s3:pgbackrest-pg18 check
+docker run --rm postgres-backup-s3:pgbackrest-pg18 backup full
+docker run --rm postgres-backup-s3:pgbackrest-pg18 info
+docker run --rm postgres-backup-s3:pgbackrest-pg18 verify
+```
+
+Physical restore is fail-closed. Mount a new empty data volume, set
+`RESTORE_TARGET_PATH`, and set `RESTORE_CONFIRM` to the exact same absolute
+path. The command refuses `/`, a non-empty directory, or the configured source
+`PGBACKREST_PG1_PATH`:
+
+```sh
+docker run --rm \
+  -e RESTORE_TARGET_PATH=/restore/pgdata \
+  -e RESTORE_CONFIRM=/restore/pgdata \
+  -v restore_data:/restore/pgdata \
+  postgres-backup-s3:pgbackrest-pg18 restore
+```
+
+The physical repository should use its own `PGBACKREST_REPO1_PATH` even when
+logical portability dumps share the same bucket. Repository bundling, block
+incremental storage, compression, retention, and S3 transport are configured
+through pgBackRest's documented `PGBACKREST_*` options.
 
 ### Verification modes
 
@@ -218,9 +281,11 @@ runtime provides an IAM/workload identity.
 | `POSTGRES_MAINTENANCE_DATABASE` | `postgres` | Connection used by create/drop database. |
 | `S3_REGION` | `us-east-1` | S3 signing region. |
 | `S3_ENDPOINT` | unset | S3-compatible endpoint URL. |
-| `S3_PREFIX` | `backup` | Object key prefix. |
+| `S3_PREFIX` | `backup` | Object key prefix. Set it to an empty string for a dedicated bucket root. |
 | `S3_STORAGE_CLASS` | unset | Optional storage class. |
 | `S3_SERVER_SIDE_ENCRYPTION` | unset | Optional S3 SSE value such as `AES256`. |
+| `S3_HEAD_MAX_ATTEMPTS` | `8` | Maximum HEAD attempts while an uploaded or server-side-copied object becomes visible. |
+| `S3_HEAD_RETRY_BASE_SECONDS` | `2` | Linear backoff base for transient post-upload 404 responses. |
 | `BACKUP_NAME` | database name | Safe object-name component. |
 | `PASSPHRASE` / `_FILE` | unset | Enables client-side GPG encryption. |
 | `PGDUMP_EXTRA_OPTS` | unset | Whitespace-delimited additional `pg_dump` flags. |
@@ -249,12 +314,13 @@ passphrase through a mode-0600 temporary file, not a command-line argument.
 
 A backup is not proven until it restores. At minimum:
 
-1. Run logical backups daily.
+1. Run logical backups periodically for portable recovery.
 2. Keep the S3 bucket in a separate provider/account from the database host.
 3. Enable bucket versioning and non-current-version retention.
 4. Run an automated disposable-database restore drill regularly.
 5. Record the restored row/application checks, not only `pg_restore --list`.
-6. Add WAL/PITR separately if losing up to one backup interval is unacceptable.
+6. Use the pgBackRest target and verify a physical restore when WAL/PITR is part
+   of the recovery objective.
 
 ## Development
 

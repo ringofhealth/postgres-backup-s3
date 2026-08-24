@@ -1,10 +1,29 @@
 ARG POSTGRES_VERSION=18
-FROM postgres:${POSTGRES_VERSION}-alpine
-
-ARG TARGETARCH=amd64
+ARG PGBACKREST_BASE_IMAGE=timescale/timescaledb-ha:pg18.4-ts2.28.3
 ARG SUPERCRONIC_VERSION=v0.2.48
 ARG SUPERCRONIC_SHA256_AMD64=88c1b66b94c486f972fdd1a4d1f901e3e75ff04f749cddd60c5db573e3a33c6c
 ARG SUPERCRONIC_SHA256_ARM64=50ae8755e04fa72812d0a1bc47a112a856811cc91cce7b6c875c378a850788bc
+
+FROM alpine:3.22 AS scheduler
+
+ARG TARGETARCH
+ARG SUPERCRONIC_VERSION
+ARG SUPERCRONIC_SHA256_AMD64
+ARG SUPERCRONIC_SHA256_ARM64
+
+RUN apk add --no-cache ca-certificates coreutils curl \
+    && case "${TARGETARCH}" in \
+         amd64) supercronic_sha256="${SUPERCRONIC_SHA256_AMD64}" ;; \
+         arm64) supercronic_sha256="${SUPERCRONIC_SHA256_ARM64}" ;; \
+         *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && curl --fail --location --show-error \
+         "https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${TARGETARCH}" \
+         --output /supercronic \
+    && echo "${supercronic_sha256}  /supercronic" | sha256sum --check --strict \
+    && chmod 0755 /supercronic
+
+FROM postgres:${POSTGRES_VERSION}-alpine AS logical
 
 RUN apk add --no-cache \
       aws-cli \
@@ -15,21 +34,13 @@ RUN apk add --no-cache \
       findutils \
       gnupg \
       jq \
+      su-exec \
       tzdata \
       util-linux \
-    && case "${TARGETARCH}" in \
-         amd64) supercronic_sha256="${SUPERCRONIC_SHA256_AMD64}" ;; \
-         arm64) supercronic_sha256="${SUPERCRONIC_SHA256_ARM64}" ;; \
-         *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
-       esac \
-    && curl --fail --location --show-error \
-         "https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${TARGETARCH}" \
-         --output /usr/local/bin/supercronic \
-    && echo "${supercronic_sha256}  /usr/local/bin/supercronic" | sha256sum --check --strict \
-    && chmod 0755 /usr/local/bin/supercronic \
     && mkdir -p /opt/postgres-backup-s3 /state /work \
     && chown -R postgres:postgres /state /work
 
+COPY --from=scheduler /supercronic /usr/local/bin/supercronic
 COPY --chmod=0755 src/*.sh /usr/local/bin/
 COPY VERSION /opt/postgres-backup-s3/VERSION
 
@@ -57,9 +68,40 @@ ENV POSTGRES_PORT=5432 \
     HOME=/var/lib/postgresql
 
 WORKDIR /opt/postgres-backup-s3
-USER postgres
 
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
   CMD ["/usr/local/bin/healthcheck.sh"]
 
-ENTRYPOINT ["/usr/local/bin/run.sh"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+# Physical/WAL mode deliberately inherits the operator's exact PostgreSQL and
+# extension image. This keeps pgBackRest and PostgreSQL versions matched while
+# the logical target above remains portable across ordinary PostgreSQL images.
+FROM ${PGBACKREST_BASE_IMAGE} AS pgbackrest
+
+USER root
+COPY --from=scheduler /supercronic /usr/local/bin/supercronic
+COPY --chmod=0755 src/pgbackrest-sidecar.sh /usr/local/bin/pgbackrest-sidecar.sh
+COPY VERSION /opt/postgres-backup-s3/VERSION
+RUN mkdir -p /opt/postgres-backup-s3 /state /var/log/pgbackrest /var/spool/pgbackrest \
+    && chown -R postgres:postgres /state /var/log/pgbackrest /var/spool/pgbackrest
+
+ENV PGBACKREST_CONFIG=/dev/null \
+    PGBACKREST_STANZA=postgres \
+    PGBACKREST_SPOOL_PATH=/var/spool/pgbackrest \
+    STATE_DIR=/state \
+    BACKUP_FULL_SCHEDULE="17 3 * * 0" \
+    BACKUP_DIFF_SCHEDULE="17 3 * * 1-6" \
+    BACKUP_INCR_SCHEDULE="47 0,6,12,18 * * *" \
+    BACKUP_CHECK_SCHEDULE="37 2 * * *" \
+    RUN_ON_STARTUP=no \
+    INIT_ON_STARTUP=yes
+
+HEALTHCHECK --interval=60s --timeout=15s --start-period=60s --retries=3 \
+  CMD ["/usr/local/bin/pgbackrest-sidecar.sh", "health"]
+
+ENTRYPOINT ["/usr/local/bin/pgbackrest-sidecar.sh"]
+CMD ["daemon"]
+
+# Preserve the historical no-target build contract and published tags.
+FROM logical AS default

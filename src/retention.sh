@@ -18,6 +18,9 @@ validate_integer INCOMPLETE_KEEP_HOURS
 require_command aws
 require_command jq
 
+backup_prefix="$(prefixed_key "${BACKUP_NAME}_")"
+incomplete_prefix="$(prefixed_key ".incomplete/${BACKUP_NAME}_")"
+
 if [[ -n "$BACKUP_KEEP_DAYS" ]]; then
   validate_integer BACKUP_KEEP_DAYS
   cutoff_epoch=$(( $(date +%s) - BACKUP_KEEP_DAYS * 86400 ))
@@ -34,7 +37,7 @@ if [[ -n "$BACKUP_KEEP_DAYS" ]]; then
     manifest_json="$(aws_command s3 cp "$(s3_uri "$manifest_key")" - --only-show-errors)"
     object_key="$(jq -r '.object.key // empty' <<< "$manifest_json")"
     case "$object_key" in
-      "${S3_PREFIX}/${BACKUP_NAME}_"*) ;;
+      "${backup_prefix}"*) ;;
       *) die "retention refused object outside configured prefix key=${object_key}" ;;
     esac
 
@@ -47,7 +50,7 @@ fi
 incomplete_cutoff=$(( $(date +%s) - INCOMPLETE_KEEP_HOURS * 3600 ))
 aws_command s3api list-objects-v2 \
   --bucket "$S3_BUCKET" \
-  --prefix "${S3_PREFIX}/.incomplete/${BACKUP_NAME}_" \
+  --prefix "$incomplete_prefix" \
   --output json |
   jq -r '.Contents[]? | [.LastModified, .Key] | @tsv' |
   while IFS=$'\t' read -r last_modified key; do

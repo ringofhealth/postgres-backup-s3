@@ -7,6 +7,11 @@ TEST_DATA_PARENT="${TEST_DATA_PARENT:-${TMPDIR:-/tmp}}"
 mkdir -p "$TEST_DATA_PARENT"
 TEST_DATA_ROOT="$(mktemp -d "${TEST_DATA_PARENT%/}/postgres-backup-s3.XXXXXX")"
 export TEST_DATA_ROOT
+mkdir -p "${TEST_DATA_ROOT}/source" \
+  "${TEST_DATA_ROOT}/target" \
+  "${TEST_DATA_ROOT}/minio" \
+  "${TEST_DATA_ROOT}/work" \
+  "${TEST_DATA_ROOT}/state"
 COMPOSE=(docker compose --project-directory "$ROOT_DIR" --file "${ROOT_DIR}/compose.test.yaml")
 
 cleanup() {
@@ -19,7 +24,20 @@ cleanup() {
     "${COMPOSE[@]}" logs --no-color --tail 200 >&2 || true
   fi
   "${COMPOSE[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
-  rm -rf "$TEST_DATA_ROOT"
+
+  # PostgreSQL and MinIO intentionally run with container-owned UIDs. When the
+  # integration roots are bind-mounted (for example onto a large CI disk), the
+  # calling user cannot necessarily remove their files. Delete only this
+  # mktemp-owned root through a short-lived root container, then remove the
+  # now-empty host directory. Cleanup must not turn a successful round trip
+  # into a failed test.
+  docker run --rm \
+    --user 0:0 \
+    --volume "${TEST_DATA_ROOT}:/test-data" \
+    --entrypoint /bin/sh \
+    "postgres:${POSTGRES_VERSION:-18}-alpine" \
+    -c 'find /test-data -mindepth 1 -delete' >/dev/null 2>&1 || true
+  rmdir "$TEST_DATA_ROOT" >/dev/null 2>&1 || true
   exit "$status"
 }
 trap cleanup EXIT
@@ -34,7 +52,7 @@ bucket_created=no
 for _attempt in $(seq 1 30); do
   # Expansion is intentionally deferred to the container's Bash process.
   # shellcheck disable=SC2016
-  if "${COMPOSE[@]}" run --rm --no-deps --entrypoint /bin/bash backup -c \
+  if "${COMPOSE[@]}" run --rm --no-deps backup /bin/bash -c \
     'source /usr/local/bin/common.sh; load_s3_environment; aws_command s3api create-bucket --bucket "$S3_BUCKET" >/dev/null 2>&1 || aws_command s3api head-bucket --bucket "$S3_BUCKET"' >/dev/null 2>&1; then
     bucket_created=yes
     break
@@ -62,9 +80,9 @@ SQL
 source_fingerprint="$("${COMPOSE[@]}" exec --no-TTY source psql --username postgres --dbname source --tuples-only --no-align --command \
   "SELECT count(*) || ':' || md5(string_agg(id || label || payload::text, '' ORDER BY id)) FROM ledger.entries")"
 
-"${COMPOSE[@]}" run --rm --no-deps --entrypoint /usr/local/bin/backup.sh backup
+"${COMPOSE[@]}" run --rm --no-deps backup backup
 
-manifest_count="$("${COMPOSE[@]}" run --rm --no-deps --entrypoint /usr/local/bin/list.sh backup | tail -n +2 | wc -l | tr -d '[:space:]')"
+manifest_count="$("${COMPOSE[@]}" run --rm --no-deps backup list | tail -n +2 | wc -l | tr -d '[:space:]')"
 [[ "$manifest_count" == "1" ]] || { echo "expected one manifest, found ${manifest_count}" >&2; exit 1; }
 
 "${COMPOSE[@]}" run --rm --no-deps \
@@ -73,8 +91,7 @@ manifest_count="$("${COMPOSE[@]}" run --rm --no-deps --entrypoint /usr/local/bin
   --env RESTORE_TARGET_DATABASE=restored \
   --env RESTORE_CONFIRM=restored \
   --env RESTORE_CREATE_DATABASE=yes \
-  --entrypoint /usr/local/bin/restore.sh \
-  backup latest
+  backup restore latest
 
 target_fingerprint="$("${COMPOSE[@]}" exec --no-TTY target psql --username postgres --dbname restored --tuples-only --no-align --command \
   "SELECT count(*) || ':' || md5(string_agg(id || label || payload::text, '' ORDER BY id)) FROM ledger.entries")"
@@ -87,18 +104,15 @@ target_fingerprint="$("${COMPOSE[@]}" exec --no-TTY target psql --username postg
   --env BACKUP_MODE=staged \
   --env BACKUP_VERIFY_MODE=archive \
   --env BACKUP_NAME=source_staged \
-  --entrypoint /usr/local/bin/backup.sh \
-  backup
+  backup backup
 "${COMPOSE[@]}" run --rm --no-deps \
   --env BACKUP_NAME=source_staged \
-  --entrypoint /usr/local/bin/verify.sh \
-  backup latest archive >/dev/null
+  backup verify latest archive >/dev/null
 
 if "${COMPOSE[@]}" run --rm --no-deps \
   --env POSTGRES_DATABASE=missing_database \
   --env BACKUP_NAME=missing_database \
-  --entrypoint /usr/local/bin/backup.sh \
-  backup; then
+  backup backup; then
   echo 'backup unexpectedly succeeded for a missing database' >&2
   exit 1
 fi
@@ -106,13 +120,12 @@ fi
 failed_manifests="$("${COMPOSE[@]}" run --rm --no-deps \
   --env POSTGRES_DATABASE=missing_database \
   --env BACKUP_NAME=missing_database \
-  --entrypoint /usr/local/bin/list.sh \
-  backup | tail -n +2 | wc -l | tr -d '[:space:]')"
+  backup list | tail -n +2 | wc -l | tr -d '[:space:]')"
 [[ "$failed_manifests" == "0" ]] || { echo 'failed backup published a manifest' >&2; exit 1; }
 
 # Expansion is intentionally deferred to the container's Bash process.
 # shellcheck disable=SC2016
-"${COMPOSE[@]}" run --rm --no-deps --entrypoint /bin/bash backup -c '
+"${COMPOSE[@]}" run --rm --no-deps backup /bin/bash -c '
   source /usr/local/bin/common.sh
   load_restore_environment
   manifest_key="$(resolve_manifest_key latest)"
@@ -121,7 +134,7 @@ failed_manifests="$("${COMPOSE[@]}" run --rm --no-deps \
   printf corrupted | aws_command s3 cp - "$(s3_uri "$object_key")" --only-show-errors
 '
 
-if "${COMPOSE[@]}" run --rm --no-deps --entrypoint /usr/local/bin/verify.sh backup latest checksum; then
+if "${COMPOSE[@]}" run --rm --no-deps backup verify latest checksum; then
   echo 'verification unexpectedly accepted a corrupted object' >&2
   exit 1
 fi

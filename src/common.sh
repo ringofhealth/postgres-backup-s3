@@ -81,16 +81,23 @@ load_s3_environment() {
   read_secret S3_SECRET_ACCESS_KEY
 
   : "${S3_REGION:=us-east-1}"
-  : "${S3_PREFIX:=backup}"
+  # Default only when the variable is unset. An explicitly empty prefix means
+  # the dedicated bucket root, which is useful when one bucket belongs to one
+  # database and avoids a redundant directory component.
+  : "${S3_PREFIX=backup}"
   : "${S3_ENDPOINT:=}"
   : "${S3_STORAGE_CLASS:=}"
   : "${S3_SERVER_SIDE_ENCRYPTION:=}"
+  : "${S3_HEAD_MAX_ATTEMPTS:=8}"
+  : "${S3_HEAD_RETRY_BASE_SECONDS:=2}"
 
   require_nonempty S3_BUCKET
+  validate_integer S3_HEAD_MAX_ATTEMPTS
+  validate_integer S3_HEAD_RETRY_BASE_SECONDS
+  (( S3_HEAD_MAX_ATTEMPTS > 0 )) || die "S3_HEAD_MAX_ATTEMPTS must be greater than zero"
 
   S3_PREFIX="${S3_PREFIX#/}"
   S3_PREFIX="${S3_PREFIX%/}"
-  [[ -n "$S3_PREFIX" ]] || die "S3_PREFIX cannot be empty"
 
   if [[ -n "${S3_ACCESS_KEY_ID:-}" ]]; then
     export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID"
@@ -222,6 +229,16 @@ s3_uri() {
   printf 's3://%s/%s' "$S3_BUCKET" "$1"
 }
 
+prefixed_key() {
+  local suffix="${1#/}"
+
+  if [[ -n "$S3_PREFIX" ]]; then
+    printf '%s/%s\n' "$S3_PREFIX" "$suffix"
+  else
+    printf '%s\n' "$suffix"
+  fi
+}
+
 s3_transfer_args() {
   S3_TRANSFER_ARGS=(--only-show-errors)
   if [[ -n "$S3_STORAGE_CLASS" ]]; then
@@ -301,9 +318,12 @@ validate_pg_archive() {
 }
 
 list_manifest_entries() {
+  local manifest_prefix
+  manifest_prefix="$(prefixed_key "${BACKUP_NAME}_")"
+
   aws_command s3api list-objects-v2 \
     --bucket "$S3_BUCKET" \
-    --prefix "${S3_PREFIX}/${BACKUP_NAME}_" \
+    --prefix "$manifest_prefix" \
     --output json |
     jq -r '.Contents[]? | select(.Key | endswith(".manifest.json")) | [.LastModified, .Key] | @tsv' |
     sort
@@ -311,7 +331,8 @@ list_manifest_entries() {
 
 resolve_manifest_key() {
   local selector="${1:-latest}"
-  local key
+  local key expected_prefix
+  expected_prefix="$(prefixed_key "${BACKUP_NAME}_")"
 
   if [[ "$selector" == "latest" ]]; then
     key="$(list_manifest_entries | tail -n 1 | cut -f2-)"
@@ -323,7 +344,7 @@ resolve_manifest_key() {
 
   [[ -n "$key" ]] || die "no published backup manifest matched selector=${selector}"
   case "$key" in
-    "${S3_PREFIX}/${BACKUP_NAME}_"*.manifest.json) ;;
+    "${expected_prefix}"*.manifest.json) ;;
     *) die "manifest key is outside the configured database prefix key=${key}" ;;
   esac
   printf '%s\n' "$key"
@@ -338,7 +359,8 @@ download_manifest() {
 
 validate_manifest() {
   local manifest="$1"
-  local schema verified database key sha bytes
+  local schema verified database key sha bytes expected_prefix
+  expected_prefix="$(prefixed_key "${BACKUP_NAME}_")"
 
   jq -e . "$manifest" >/dev/null || die "backup manifest is not valid JSON"
   schema="$(jq -r '.schema_version // empty' "$manifest")"
@@ -355,7 +377,7 @@ validate_manifest() {
   [[ "$sha" =~ ^[a-f0-9]{64}$ ]] || die "manifest has an invalid SHA-256 digest"
   [[ "$bytes" =~ ^[0-9]+$ ]] || die "manifest has an invalid object byte count"
   case "$key" in
-    "${S3_PREFIX}/${BACKUP_NAME}_"*) ;;
+    "${expected_prefix}"*) ;;
     *) die "backup object is outside the configured database prefix key=${key}" ;;
   esac
 }
@@ -367,12 +389,41 @@ head_and_validate_object() {
   expected_bytes="$(jq -r '.object.bytes' "$manifest")"
   expected_sha="$(jq -r '.object.sha256' "$manifest")"
 
-  head="$(aws_command s3api head-object --bucket "$S3_BUCKET" --key "$key" --output json)"
+  head="$(head_object_with_retry "$key")"
   actual_bytes="$(jq -r '.ContentLength' <<< "$head")"
   metadata_sha="$(jq -r '.Metadata.sha256 // empty' <<< "$head")"
 
   [[ "$actual_bytes" == "$expected_bytes" ]] || die "remote object size mismatch expected=${expected_bytes} actual=${actual_bytes}"
   [[ "$metadata_sha" == "$expected_sha" ]] || die "remote object checksum metadata mismatch"
+}
+
+head_object_with_retry() {
+  local key="$1"
+  local attempt=1
+  local delay_seconds
+  local output
+
+  while true; do
+    if output="$(aws_command s3api head-object --bucket "$S3_BUCKET" --key "$key" --output json 2>&1)"; then
+      printf '%s\n' "$output"
+      return 0
+    fi
+
+    if [[ "$output" != *"(404)"* && "$output" != *"Not Found"* && "$output" != *"NoSuchKey"* ]]; then
+      printf '%s\n' "$output" >&2
+      return 1
+    fi
+
+    if (( attempt >= S3_HEAD_MAX_ATTEMPTS )); then
+      printf '%s\n' "$output" >&2
+      return 1
+    fi
+
+    delay_seconds=$((S3_HEAD_RETRY_BASE_SECONDS * attempt))
+    log warning "uploaded object is not visible yet; retrying head key=${key} attempt=${attempt} delay_seconds=${delay_seconds}"
+    sleep "$delay_seconds"
+    attempt=$((attempt + 1))
+  done
 }
 
 stream_remote_sha256() {
