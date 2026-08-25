@@ -12,13 +12,21 @@ ARG SUPERCRONIC_SHA256_AMD64
 ARG SUPERCRONIC_SHA256_ARM64
 
 RUN apk add --no-cache ca-certificates coreutils curl \
-    && case "${TARGETARCH}" in \
+    && target_arch="${TARGETARCH:-}" \
+    && if [ -z "$target_arch" ]; then \
+         case "$(apk --print-arch)" in \
+           x86_64) target_arch=amd64 ;; \
+           aarch64) target_arch=arm64 ;; \
+           *) echo "Unsupported Alpine architecture: $(apk --print-arch)" >&2; exit 1 ;; \
+         esac; \
+       fi \
+    && case "$target_arch" in \
          amd64) supercronic_sha256="${SUPERCRONIC_SHA256_AMD64}" ;; \
          arm64) supercronic_sha256="${SUPERCRONIC_SHA256_ARM64}" ;; \
-         *) echo "Unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+         *) echo "Unsupported architecture: ${target_arch}" >&2; exit 1 ;; \
        esac \
     && curl --fail --location --show-error \
-         "https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${TARGETARCH}" \
+         "https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${target_arch}" \
          --output /supercronic \
     && echo "${supercronic_sha256}  /supercronic" | sha256sum --check --strict \
     && chmod 0755 /supercronic
