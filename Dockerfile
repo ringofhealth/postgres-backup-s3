@@ -49,8 +49,9 @@ RUN apk add --no-cache \
     && chown -R postgres:postgres /state /work
 
 COPY --from=scheduler /supercronic /usr/local/bin/supercronic
-COPY --chmod=0755 src/*.sh /usr/local/bin/
+COPY src/*.sh /usr/local/bin/
 COPY VERSION /opt/postgres-backup-s3/VERSION
+RUN chmod 0755 /usr/local/bin/*.sh
 
 ENV POSTGRES_PORT=5432 \
     POSTGRES_MAINTENANCE_DATABASE=postgres \
@@ -89,9 +90,10 @@ FROM ${PGBACKREST_BASE_IMAGE} AS pgbackrest
 
 USER root
 COPY --from=scheduler /supercronic /usr/local/bin/supercronic
-COPY --chmod=0755 src/pgbackrest-sidecar.sh /usr/local/bin/pgbackrest-sidecar.sh
+COPY src/pgbackrest-sidecar.sh /usr/local/bin/pgbackrest-sidecar.sh
 COPY VERSION /opt/postgres-backup-s3/VERSION
 RUN mkdir -p /opt/postgres-backup-s3 /state /var/log/pgbackrest /var/spool/pgbackrest \
+    && chmod 0755 /usr/local/bin/pgbackrest-sidecar.sh \
     && chown -R postgres:postgres /state /var/log/pgbackrest /var/spool/pgbackrest
 
 ENV PGBACKREST_CONFIG=/dev/null \
